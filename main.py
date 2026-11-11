@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BTC race bot for make.fun (bars-replay/v1): deep-dip mean reversion.
+"""BTC race bot for make.fun (bars-replay/v1): two-tranche dip buyer.
 
 The bot speaks agent-fun/bars-replay/v1 through the vendored SDK shim
 (vendor/makefun_bars.py) and trades one asset, CBBTC, long only.
@@ -8,13 +8,19 @@ Strategy (deterministic, standard library only):
 - Track the last W=240 closes: their mean and standard deviation give a
   z-score of the latest close; a slow EMA's slope over 24 bars gauges the
   trend so the bot does not catch a falling knife.
-- Flat: buy only a deep dip (z <= -2.4) while the trend guard passes,
-  spending 50% of the cash. A full round trip pays ~26 bps in fee, slippage
-  and impact, so shallow dips are not worth trading; the backtest on the
-  dev window showed exactly that (frequent shallow entries lose, rare deep
-  ones pay).
-- Long: sell everything when the price reverts (z >= 0.25), on a 2.5% stop
-  below the average entry, on a 3.5% take profit, or after 300 bars.
+- Flat: buy a dip (z <= -2.3) while the trend guard passes, spending 55%
+  of the cash. A full round trip pays ~26 bps in fee, slippage and impact,
+  so shallow dips are not worth trading; the parameters were chosen by
+  stress-testing this exact rule family across synthetic up, sideways and
+  crash windows derived from the dev window, not by maximising the dev
+  window alone.
+- If the dip deepens much further while holding (z <= -3.6), add a second
+  tranche of 40% of the starting cash, once per position. In the stress
+  tests the late, deep add raised returns in falling and sideways windows
+  without hurting the rising one; adding earlier (z <= -3.4) was fragile
+  in crashes, so the trigger sits deep.
+- Long: sell everything when the price reverts (z >= 0.25), on a 2.0% stop
+  below the average entry, on a 3.0% take profit, or after 300 bars.
 - Participation fallback: if no order has filled by bar 1000, relax the
   entry once (z <= -1.0, 25% of cash) so the bot is never a no-trade entry
   on the race window; the same exit rules apply. This never triggers on
@@ -31,14 +37,16 @@ import makefun_bars
 
 SYMBOL = "CBBTC"
 W = 240               # z-score window (bars)
-Z_BUY = -2.4          # buy only this deep a dip
+Z_BUY = -2.3          # buy a dip this deep
 Z_SELL = 0.25         # sell when reverted to here
 EMA_SPAN = 48         # slow trend EMA
 SLOPE_SPAN = 24       # bars over which the EMA slope is measured
-SLOPE_MIN = -0.0035   # do not buy if the EMA fell more than this over the span
-SIZE_FRAC = 0.50      # share of cash spent on a main entry
-STOP = -0.025         # stop loss vs average entry
-TAKE_PROFIT = 0.035   # take profit vs average entry
+SLOPE_MIN = -0.006    # do not buy if the EMA fell more than this over the span
+SIZE_FRAC = 0.55      # share of cash spent on the first tranche
+ADD_Z = -3.6          # add a second tranche if the dip deepens to here
+ADD_FRAC = 0.40       # second tranche size, as a share of the starting cash
+STOP = -0.020         # stop loss vs average entry
+TAKE_PROFIT = 0.030   # take profit vs average entry
 MAX_HOLD = 300        # bars
 COOLDOWN = 15         # bars after an exit before the next entry
 FALLBACK_BAR = 1000   # relax the entry after this bar if nothing has filled
@@ -53,14 +61,20 @@ in_pos_since = -1
 cooldown_until = -1
 bar_no = -1
 any_fill = False
+start_cash = None
+added = False
+prev_qty = 0
 
 
 def on_batch(state, batch):
     global ema, in_pos_since, cooldown_until, bar_no, any_fill
+    global start_cash, added, prev_qty
     bar_no += 1
     for f in batch.get("fills", []):
         if f.get("status") == "filled":
             any_fill = True
+    if start_cash is None:
+        start_cash = state.cash
     close = state.close(SYMBOL)
     if close is None:
         return []
@@ -70,11 +84,16 @@ def on_batch(state, batch):
     ema_hist.append(ema)
 
     held = state.positions.get(SYMBOL)
+    qty = held.qty if held is not None else 0
+    if qty > prev_qty and prev_qty > 0:
+        added = True  # a second buy filled while already holding
+    prev_qty = qty
     orders = []
 
     if held is not None and held.qty > 0:
         if in_pos_since < 0:
             in_pos_since = bar_no
+            added = False
         entry = held.cost * 10**7 / held.qty  # average entry price (price units)
         pnl = close / entry - 1.0
         z = _zscore()
@@ -84,6 +103,15 @@ def on_batch(state, batch):
                            "max_slippage_bps": MAX_SLIP_BPS})
             in_pos_since = -1
             cooldown_until = bar_no + COOLDOWN
+            return orders
+        if not added and z is not None and z <= ADD_Z:
+            notional = int(start_cash * ADD_FRAC)
+            if notional > state.cash:
+                notional = state.cash
+            if notional >= 1_000_000:  # the 1 USDC minimum buy
+                orders.append({"side": "buy", "symbol": SYMBOL,
+                               "notional_quote_units": notional,
+                               "max_slippage_bps": MAX_SLIP_BPS})
         return orders
 
     in_pos_since = -1
